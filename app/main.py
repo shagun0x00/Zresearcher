@@ -1,4 +1,5 @@
 
+# Main entry point for our FastAPI app. Wires up all the agents and endpoints.
 from fastapi import FastAPI
 from datetime import datetime, timezone
 import asyncio
@@ -14,7 +15,12 @@ from app.services.llm_service import (
     LLMServiceError,
 )
 
+from app.agents.researcher import run_research_tasks_parallel
 
+from app.schemas.research import (
+    ResearchPlan,
+    ResearchWorkerResult,
+)
 
 app = FastAPI(
     title="Autonomous AI Research Team",
@@ -23,12 +29,14 @@ app = FastAPI(
 )
 
 
+# Incoming prompt payload for generic LLM calls
 class PromptRequest(BaseModel):
     prompt: str = Field(
         min_length=5,
         max_length=10000
     )
 
+# Payload when someone asks a specific research question
 class ResearchQuestionRequest(BaseModel):
     question: str = Field(
         min_length=5,
@@ -36,6 +44,7 @@ class ResearchQuestionRequest(BaseModel):
     )
 
 
+# Quick health check for Docker/k8s probes
 @app.get("/health")
 def health():
     return {
@@ -44,7 +53,7 @@ def health():
     }
 
 
-
+# Root check just to see if the server is awake and kicking
 @app.get("/")
 async def root():
     return {
@@ -54,10 +63,12 @@ async def root():
     }
 
 
+# Simple sandbox endpoint to test raw prompts against the LLM
 @app.post("/api/test-llm")
 async def test_llm(request: PromptRequest):
 
     try:
+        # Run in thread so we don't block the event loop
         result = await asyncio.to_thread(
             llm_service.generate_response,
             request.prompt,
@@ -74,11 +85,13 @@ async def test_llm(request: PromptRequest):
             detail="LLM provider request failed.",
         )
 
+# Endpoint to kick off a brand new research plan given a topic
 @app.post("/api/plan", response_model=ResearchPlan)
 async def create_research_plan(
     request: ResearchQuestionRequest
 ):
     try:
+        # Let the planner agent break down the question into concrete tasks
         plan = await asyncio.to_thread(
             planner_agent.create_plan,
             request.question,
@@ -87,19 +100,42 @@ async def create_research_plan(
         return plan
 
     except ValueError as exc:
+        # Bad input from the user, let them know why
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         )
 
     except LLMServiceError:
+        # OpenRouter or the underlying provider threw a fit
         raise HTTPException(
             status_code=502,
             detail="Research planning failed because the LLM provider failed.",
         )
 
     except Exception:
+        # Catch-all for unexpected gremlins
         raise HTTPException(
             status_code=500,
             detail="Unexpected research planner error.",
+        )
+
+@app.post(
+    "/api/research",
+    response_model=list[ResearchWorkerResult],
+)
+async def execute_research(plan: ResearchPlan):
+
+    try:
+        results = await asyncio.to_thread(
+            run_research_tasks_parallel,
+            plan.tasks,
+        )
+
+        return results
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Research execution failed.",
         )
