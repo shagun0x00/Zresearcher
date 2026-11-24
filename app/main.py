@@ -21,6 +21,12 @@ from app.schemas.research import (
     ResearchPlan,
     ResearchWorkerResult,
 )
+from app.workflows.research_graph import research_graph
+
+from fastapi import HTTPException
+
+from app.workflows.research_graph import research_graph
+from app.services.llm_service import LLMServiceError
 
 app = FastAPI(
     title="Autonomous AI Research Team",
@@ -138,4 +144,75 @@ async def execute_research(plan: ResearchPlan):
         raise HTTPException(
             status_code=500,
             detail="Research execution failed.",
+        )
+
+
+@app.post("/api/research/run")
+async def run_complete_research(request: ResearchQuestionRequest):
+
+    try:
+        result = await asyncio.to_thread(
+            research_graph.invoke,
+            {
+                "question": request.question,
+                "worker_results": [],
+            },
+            {
+                "max_concurrency": 3,
+            },
+        )
+
+        return {
+            "success": True,
+
+            "research_plan": result["plan"].model_dump(),
+
+            "worker_results": [
+                worker.model_dump()
+                for worker in result["ordered_results"]
+            ],
+
+            "research_summary": result["summary"],
+
+            "evidence_analysis": (
+                result["evidence_analysis"].model_dump()
+            ),
+
+            "fact_check_results": [
+                claim.model_dump()
+                for claim in result["fact_check_results"]
+            ],
+
+            "fact_check_summary": {
+                "total_claims": len(result["fact_check_results"]),
+
+                "supported": sum(
+                    claim.verdict == "supported"
+                    for claim in result["fact_check_results"]
+                ),
+
+                "contradicted": sum(
+                    claim.verdict == "contradicted"
+                    for claim in result["fact_check_results"]
+                ),
+
+                "insufficient": sum(
+                    claim.verdict == "insufficient"
+                    for claim in result["fact_check_results"]
+                ),
+            },
+        }
+
+    except LLMServiceError:
+        raise HTTPException(
+            status_code=502,
+            detail="LLM provider request failed.",
+        )
+
+    except Exception as exc:
+        print(f"[API] Research workflow failed: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Research workflow failed.",
         )

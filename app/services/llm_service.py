@@ -1,5 +1,8 @@
-# Handles all our communication with OpenRouter / LLM APIs.
+
+# app/services/llm_service.py
+
 import json
+import time
 
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -8,14 +11,15 @@ from app.config import OPENROUTER_API_KEY, OPENROUTER_MODEL
 
 
 class LLMServiceError(Exception):
-    """Custom exception we raise whenever the LLM flakes out or returns garbage."""
+    """Raised when the LLM request fails or returns invalid output."""
 
 
 class LLMService:
-    """Wrapper around the OpenAI client configured for OpenRouter endpoints."""
 
     def __init__(self):
-        # Fire up the OpenAI SDK pointing to OpenRouter's base URL
+        if not OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY is missing from .env")
+
         self.client = OpenAI(
             api_key=OPENROUTER_API_KEY,
             base_url="https://openrouter.ai/api/v1",
@@ -24,98 +28,125 @@ class LLMService:
         )
 
         self.model = OPENROUTER_MODEL
+        self.max_attempts = 3
 
-    def generate_response(self, prompt: str) -> str:
-        """Send a standard text prompt and get back a raw string response."""
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
-                temperature=0.2, # Keep things relatively deterministic
+    def _extract_content(self, response) -> str:
+        """Safely extract text from an OpenAI-compatible response."""
+
+        if not response or not response.choices:
+            raise LLMServiceError("The model returned no response choices.")
+
+        message = response.choices[0].message
+        content = message.content
+
+        if not content or not content.strip():
+            finish_reason = response.choices[0].finish_reason
+            raise LLMServiceError(
+                f"The model returned empty content. Finish reason: {finish_reason}"
             )
 
-            content = response.choices[0].message.content
+        return content.strip()
 
-            # Sometimes models return empty content even on 200 OK, guard against that
-            if not content:
-                raise LLMServiceError(
-                    "The model returned an empty response."
+    def generate_response(self, prompt: str) -> str:
+        """Generate a normal text response with retry handling."""
+
+        last_error = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        }
+                    ],
+                    temperature=0.2,
                 )
 
-            return content
+                return self._extract_content(response)
 
-        except LLMServiceError:
-            raise
+            except Exception as exc:
+                last_error = exc
 
-        except Exception as exc:
-            raise LLMServiceError(
-                f"LLM request failed: {exc}"
-            ) from exc
+                if attempt < self.max_attempts:
+                    time.sleep(attempt * 2)
+
+        raise LLMServiceError(
+            f"LLM request failed after {self.max_attempts} attempts: {last_error}"
+        ) from last_error
 
     def generate_structured_response(
         self,
         prompt: str,
         schema: type[BaseModel],
     ) -> BaseModel:
-        """Force the model to return JSON matching a specific Pydantic schema."""
+        """Generate and validate a structured Pydantic response."""
 
-        # Craft a strict system-like instruction asking for exact JSON format
         structured_prompt = f"""
-{prompt}
+You are a structured data generation system.
 
-Return only valid JSON.
-Do not include markdown code fences.
+Follow the instructions and return one valid JSON object.
 
-Your response must follow this JSON schema:
+Rules:
+- Return JSON only.
+- Do not use Markdown code fences.
+- Do not add explanations outside the JSON.
+- Include every required field.
+- Use the correct data types.
+- Do not invent unsupported information.
+- If a list has no items, return an empty list.
+
+Required JSON schema:
 
 {json.dumps(schema.model_json_schema(), indent=2)}
+
+TASK:
+
+{prompt}
 """
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": structured_prompt,
-                    }
-                ],
-                temperature=0.1, # Extra low temp so it doesn't get creative with keys
-                response_format={
-                    "type": "json_object"
-                },
-            )
+        last_error = None
 
-            content = response.choices[0].message.content
-
-            if not content:
-                raise LLMServiceError(
-                    "The model returned an empty JSON response."
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": structured_prompt,
+                        }
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
                 )
 
-            # Parse raw JSON string into a dict
-            data = json.loads(content)
+                content = self._extract_content(response)
 
-            # Validate and instantiate our Pydantic model
-            return schema.model_validate(data)
+                # Remove accidental Markdown code fences.
+                if content.startswith("```"):
+                    content = content.replace("```json", "", 1)
+                    content = content.replace("```", "").strip()
 
-        except (json.JSONDecodeError, ValidationError) as exc:
-            raise LLMServiceError(
-                f"Invalid structured response: {exc}"
-            ) from exc
+                data = json.loads(content)
 
-        except LLMServiceError:
-            raise
+                return schema.model_validate(data)
 
-        except Exception as exc:
-            raise LLMServiceError(
-                f"Structured generation failed: {exc}"
-            ) from exc
+            except (json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+
+            except Exception as exc:
+                last_error = exc
+
+            if attempt < self.max_attempts:
+                time.sleep(attempt * 2)
+
+        raise LLMServiceError(
+            f"Structured generation failed after "
+            f"{self.max_attempts} attempts: {last_error}"
+        ) from last_error
 
 
 # Shared service instance
